@@ -1,4 +1,4 @@
-//! Statement journal flag analysis (`is_multi_write` / `may_abort`).
+//! SQLite statement journal flag analysis (`is_multi_write` / `may_abort`).
 //!
 //! Inside an explicit transaction (BEGIN...COMMIT), each statement runs within
 //! the larger transaction. If a statement partially completes and then aborts
@@ -8,7 +8,13 @@
 //! savepoint taken at the start of each statement, rolled back on abort.
 //!
 //! Statement journals are expensive, so SQLite skips them when provably
-//! unnecessary. The condition is: `usesStmtJournal = isMultiWrite && mayAbort`.
+//! unnecessary. The SQLite condition is:
+//! `usesStmtJournal = isMultiWrite && mayAbort`.
+//!
+//! Turso can also abandon a statement after a cooperative I/O yield. Because
+//! single-row overflow and freelist changes can yield mid-operation, Turso opens
+//! statement subtransactions for all write statements. These flags are retained
+//! for DML classification and SQLite-style abort behavior analysis.
 //!
 //! - **isMultiWrite**: the statement may modify more than one row (or more than
 //!   one table, e.g. FK counter + data table). A single-row write is atomic —
@@ -19,7 +25,7 @@
 //!   multi-write statement can never abort, partial rollback is moot.
 //!
 //! Both flags default to `true` (conservative). Each DML translate path calls
-//! into this module to set them to `false` when safe.
+//! into this module to set them to `false` when safe for that classification.
 
 use crate::translate::emitter::Resolver;
 use crate::translate::plan::{DeletePlan, DmlSafetyReason, UpdatePlan};

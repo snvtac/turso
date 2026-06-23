@@ -1,7 +1,7 @@
-/// Tests that the `needs_stmt_subtransactions` flag is correctly set based on
-/// the is_multi_write and may_abort analysis during statement compilation.
+/// Tests that write statements are marked as needing a statement subtransaction.
 ///
-/// These tests mirror SQLite's usesStmtJournal = isMultiWrite && mayAbort (vdbeaux.c:2685).
+/// SQLite uses statement journals for `isMultiWrite && mayAbort`. Turso also
+/// needs them for writes that can be abandoned after a cooperative I/O yield.
 use crate::common::TempDatabase;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -34,11 +34,10 @@ fn query_rows(conn: &Arc<turso_core::Connection>, sql: &str) -> Vec<String> {
 // ──────────────────────────────────────────────────────────
 
 /// Single-row INSERT into a table with no constraints, no triggers, no FKs.
-/// Neither multi-write nor may-abort.
 #[turso_macros::test(init_sql = "CREATE TABLE t (a, b, c);")]
 fn insert_single_row_no_constraints(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
-    assert!(!needs_stmt_journal(&conn, "INSERT INTO t VALUES (1, 2, 3)"));
+    assert!(needs_stmt_journal(&conn, "INSERT INTO t VALUES (1, 2, 3)"));
     Ok(())
 }
 
@@ -46,8 +45,8 @@ fn insert_single_row_no_constraints(tmp_db: TempDatabase) -> anyhow::Result<()> 
 #[turso_macros::test(init_sql = "CREATE TABLE t (a, b, c);")]
 fn insert_multi_row_no_constraints(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
-    // Multi-row but no may_abort → still no stmt journal.
-    assert!(!needs_stmt_journal(
+    // Multi-row writes need a statement rollback point if abandoned after I/O.
+    assert!(needs_stmt_journal(
         &conn,
         "INSERT INTO t VALUES (1,2,3),(4,5,6)"
     ));
@@ -58,9 +57,7 @@ fn insert_multi_row_no_constraints(tmp_db: TempDatabase) -> anyhow::Result<()> {
 #[turso_macros::test(init_sql = "CREATE TABLE t (a NOT NULL, b);")]
 fn insert_single_row_notnull(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
-    // Single-row (not multi-write) but may_abort.
-    // needs_stmt = multi_write && may_abort = false && true = false.
-    assert!(!needs_stmt_journal(&conn, "INSERT INTO t VALUES (1, 2)"));
+    assert!(needs_stmt_journal(&conn, "INSERT INTO t VALUES (1, 2)"));
     Ok(())
 }
 
@@ -90,7 +87,7 @@ fn insert_multi_row_unique(tmp_db: TempDatabase) -> anyhow::Result<()> {
 #[turso_macros::test(init_sql = "CREATE TABLE t (a UNIQUE, b);")]
 fn insert_or_ignore_multi_row_unique(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
-    assert!(!needs_stmt_journal(
+    assert!(needs_stmt_journal(
         &conn,
         "INSERT OR IGNORE INTO t VALUES (1, 2), (3, 4)"
     ));
@@ -98,12 +95,10 @@ fn insert_or_ignore_multi_row_unique(tmp_db: TempDatabase) -> anyhow::Result<()>
 }
 
 /// INSERT OR REPLACE is multi-write (REPLACE may delete conflicting rows).
-/// But may_abort=false (conflict resolution is not OE_Abort).
-/// needs_stmt = true && false = false.
 #[turso_macros::test(init_sql = "CREATE TABLE t (a UNIQUE, b);")]
 fn insert_or_replace_single_row(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
-    assert!(!needs_stmt_journal(
+    assert!(needs_stmt_journal(
         &conn,
         "INSERT OR REPLACE INTO t VALUES (1, 2)"
     ));
@@ -111,11 +106,10 @@ fn insert_or_replace_single_row(tmp_db: TempDatabase) -> anyhow::Result<()> {
 }
 
 /// AUTOINCREMENT is multi-write (writes to sqlite_sequence).
-/// No constraints → may_abort=false. needs_stmt = true && false = false.
 #[turso_macros::test(init_sql = "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v);")]
 fn insert_autoincrement_single_row(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
-    assert!(!needs_stmt_journal(&conn, "INSERT INTO t (v) VALUES (1)"));
+    assert!(needs_stmt_journal(&conn, "INSERT INTO t (v) VALUES (1)"));
     Ok(())
 }
 
@@ -138,9 +132,8 @@ fn insert_select_source(tmp_db: TempDatabase) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Single-row INSERT with immediate FK constraints does NOT need a statement journal.
-/// Immediate FK violations emit a direct Halt before any writes (matching SQLite's
-/// usesStmtJournal=0 for this case), so there's nothing to roll back.
+/// Single-row INSERT with immediate FK constraints still needs a statement
+/// subtransaction so it can be abandoned safely after I/O yield.
 #[turso_macros::test(init_sql = "CREATE TABLE parent (id INTEGER PRIMARY KEY);")]
 fn insert_single_row_with_immediate_fk(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
@@ -148,10 +141,7 @@ fn insert_single_row_with_immediate_fk(tmp_db: TempDatabase) -> anyhow::Result<(
     conn.execute(
         "CREATE TABLE child (id UNIQUE, pid INT, FOREIGN KEY(pid) REFERENCES parent(id))",
     )?;
-    assert!(!needs_stmt_journal(
-        &conn,
-        "INSERT INTO child VALUES (1, 1)"
-    ));
+    assert!(needs_stmt_journal(&conn, "INSERT INTO child VALUES (1, 1)"));
     Ok(())
 }
 
@@ -193,8 +183,7 @@ fn insert_fk_violation_in_tx_rolls_back_row(tmp_db: TempDatabase) -> anyhow::Res
 #[turso_macros::test(init_sql = "CREATE TABLE t (a, b);")]
 fn update_no_where(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
-    // Multi-write (table scan), but no constraints → may_abort=false.
-    assert!(!needs_stmt_journal(&conn, "UPDATE t SET a = 1"));
+    assert!(needs_stmt_journal(&conn, "UPDATE t SET a = 1"));
     Ok(())
 }
 
@@ -210,9 +199,7 @@ fn update_no_where_notnull(tmp_db: TempDatabase) -> anyhow::Result<()> {
 #[turso_macros::test(init_sql = "CREATE TABLE t (a NOT NULL, b);")]
 fn update_by_rowid(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
-    // Single-row → not multi-write. may_abort=true (NOT NULL).
-    // needs_stmt = false && true = false.
-    assert!(!needs_stmt_journal(
+    assert!(needs_stmt_journal(
         &conn,
         "UPDATE t SET a = 1 WHERE rowid = 5"
     ));
@@ -223,10 +210,7 @@ fn update_by_rowid(tmp_db: TempDatabase) -> anyhow::Result<()> {
 #[turso_macros::test(init_sql = "CREATE TABLE t (id INTEGER PRIMARY KEY, a NOT NULL, b);")]
 fn update_by_rowid_alias(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
-    assert!(!needs_stmt_journal(
-        &conn,
-        "UPDATE t SET a = 1 WHERE id = 5"
-    ));
+    assert!(needs_stmt_journal(&conn, "UPDATE t SET a = 1 WHERE id = 5"));
     Ok(())
 }
 
@@ -234,7 +218,7 @@ fn update_by_rowid_alias(tmp_db: TempDatabase) -> anyhow::Result<()> {
 #[turso_macros::test(init_sql = "CREATE TABLE t (a NOT NULL, b UNIQUE);")]
 fn update_by_unique_index(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
-    assert!(!needs_stmt_journal(&conn, "UPDATE t SET a = 1 WHERE b = 5"));
+    assert!(needs_stmt_journal(&conn, "UPDATE t SET a = 1 WHERE b = 5"));
     Ok(())
 }
 
@@ -256,12 +240,10 @@ fn update_unindexed_where(tmp_db: TempDatabase) -> anyhow::Result<()> {
 }
 
 /// UPDATE OR REPLACE → always multi-write (can delete conflicting rows).
-/// But may_abort = false (conflict resolution is not OE_Abort).
-/// needs_stmt = true && false = false.
 #[turso_macros::test(init_sql = "CREATE TABLE t (id INTEGER PRIMARY KEY, a UNIQUE);")]
 fn update_or_replace_by_rowid(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
-    assert!(!needs_stmt_journal(
+    assert!(needs_stmt_journal(
         &conn,
         "UPDATE OR REPLACE t SET a = 1 WHERE id = 5"
     ));
@@ -273,7 +255,7 @@ fn update_or_replace_by_rowid(tmp_db: TempDatabase) -> anyhow::Result<()> {
 fn update_composite_unique_all_cols(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
     conn.execute("CREATE UNIQUE INDEX idx_bc ON t(b, c)")?;
-    assert!(!needs_stmt_journal(
+    assert!(needs_stmt_journal(
         &conn,
         "UPDATE t SET a = 1 WHERE b = 1 AND c = 2"
     ));
@@ -293,11 +275,11 @@ fn update_composite_unique_partial_cols(tmp_db: TempDatabase) -> anyhow::Result<
 // DELETE
 // ──────────────────────────────────────────────────────────
 
-/// DELETE with no WHERE (table scan) + no constraints → multi-write, no may-abort.
+/// DELETE with no WHERE (table scan) is multi-write.
 #[turso_macros::test(init_sql = "CREATE TABLE t (a, b);")]
 fn delete_no_where(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
-    assert!(!needs_stmt_journal(&conn, "DELETE FROM t"));
+    assert!(needs_stmt_journal(&conn, "DELETE FROM t"));
     Ok(())
 }
 
@@ -305,7 +287,7 @@ fn delete_no_where(tmp_db: TempDatabase) -> anyhow::Result<()> {
 #[turso_macros::test(init_sql = "CREATE TABLE t (a, b);")]
 fn delete_by_rowid(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
-    assert!(!needs_stmt_journal(&conn, "DELETE FROM t WHERE rowid = 5"));
+    assert!(needs_stmt_journal(&conn, "DELETE FROM t WHERE rowid = 5"));
     Ok(())
 }
 
@@ -313,7 +295,7 @@ fn delete_by_rowid(tmp_db: TempDatabase) -> anyhow::Result<()> {
 #[turso_macros::test(init_sql = "CREATE TABLE t (a, b UNIQUE);")]
 fn delete_by_unique_index(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
-    assert!(!needs_stmt_journal(&conn, "DELETE FROM t WHERE b = 5"));
+    assert!(needs_stmt_journal(&conn, "DELETE FROM t WHERE b = 5"));
     Ok(())
 }
 
@@ -484,12 +466,12 @@ fn update_abort_partial_index_not_preflighted(tmp_db: TempDatabase) -> anyhow::R
     conn.execute("INSERT INTO t VALUES(1, 10, 100)")?;
     conn.execute("INSERT INTO t VALUES(2, 20, 200)")?;
     // With three-phase index updates, constraint checks (Phase 1) are fully
-    // separated from mutations (Phase 2+3), so partial unique indexes do not
-    // require the statement journal for single-row updates — Phase 1 handles
-    // the partial index constraint check before any IdxDelete/IdxInsert.
+    // separated from mutations (Phase 2+3), but Turso still opens a statement
+    // subtransaction so abandoning the statement after an I/O yield can roll
+    // back safely.
     assert!(
-        !needs_stmt_journal(&conn, "UPDATE t SET b=40, c=200 WHERE a=1"),
-        "stmt journal not needed: three-phase update handles partial indexes"
+        needs_stmt_journal(&conn, "UPDATE t SET b=40, c=200 WHERE a=1"),
+        "write statements need abandoned-statement rollback"
     );
 
     conn.execute("BEGIN")?;

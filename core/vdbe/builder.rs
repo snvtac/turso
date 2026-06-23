@@ -340,9 +340,8 @@ impl ProgramBuilderFlags {
 
     #[inline]
     /// Mirrors SQLite's isMultiWrite: true if the statement may modify/insert multiple rows.
-    /// If a non-autocommit transaction can modify multiple rows, statement subjournaling is always
-    /// required for proper cleanup on abort. If only one row can be modified, then journaling is not
-    /// necessary because on abort there is nothing to clean up.
+    /// Turso opens statement subtransactions for all write statements, but this flag is still
+    /// useful to classify SQLite-style multi-write and constraint-abort behavior.
     /// Defaults to true for safety; specific translate paths (e.g., single-row INSERT) set false.
     pub const fn is_multi_write(self) -> bool {
         self.get(Self::IS_MULTI_WRITE)
@@ -354,7 +353,8 @@ impl ProgramBuilderFlags {
 
     #[inline]
     /// Mirrors SQLite's mayAbort: true if the statement may throw an ABORT exception.
-    /// This flag is used in combination with is_multi_write to determine if statement subjournaling is required.
+    /// This flag is useful for SQLite-style constraint-abort analysis; Turso opens statement
+    /// subtransactions for all write statements so abandoned writes can be rolled back after I/O yield.
     /// Defaults to true for safety; specific translate paths (e.g., INSERT with no constraints) set false.
     pub const fn may_abort(self) -> bool {
         self.get(Self::MAY_ABORT)
@@ -823,7 +823,6 @@ impl ProgramBuilder {
     }
 
     /// Mark that this statement may modify/insert multiple rows (mirrors SQLite's sqlite3MultiWrite).
-    /// When false, statement journals are skipped since single-write statements are atomic.
     pub const fn set_multi_write(&mut self, is_multi_write: bool) {
         self.flags.set_is_multi_write(is_multi_write);
     }
@@ -1944,14 +1943,12 @@ impl ProgramBuilder {
 
         self.parameters.list.dedup();
 
-        // Mirrors SQLite's: usesStmtJournal = isMultiWrite && mayAbort
-        // Statement journals are only needed when a statement writes multiple rows AND could
-        // abort midway (e.g. constraint violation). Single-row writes are atomic and don't
-        // need statement-level rollback. Both flags default to true; specific translate paths
-        // (e.g., single-row INSERT) set is_multi_write=false to opt out.
-        let needs_stmt_subtransactions = matches!(self.txn_mode, TransactionMode::Write)
-            && self.flags.is_multi_write()
-            && self.flags.may_abort();
+        // SQLite's constraint-abort rule is `isMultiWrite && mayAbort`, but Turso
+        // can yield cooperative I/O mid-statement. A caller may then reset/drop
+        // the statement before it reaches Halt, so any write statement in an
+        // explicit transaction needs a statement savepoint to roll back abandoned
+        // partial changes.
+        let needs_stmt_subtransactions = matches!(self.txn_mode, TransactionMode::Write);
 
         let contains_trigger_subprograms = self
             .insns
